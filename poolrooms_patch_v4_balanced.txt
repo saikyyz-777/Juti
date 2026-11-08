@@ -1,0 +1,500 @@
+--[[
+THE POOLROOMS — PATCH v2
+Carrega a sua versão do GitHub e aplica por cima:
+  1) Anticheat mais forte (limites mais apertados + camadas extras)
+  2) Ao escapar: Poolrooms é destruída e abre a tela "Claim your UGC!!"
+  3) Enter só funciona com algo escrito; envia pro seu webhook:
+     valor do campo, ID do jogador, tempo pra fugir e se o anticheat pegou
+  4) Porta EXIT muito mais frequente (e garantida quando o sorteio acerta)
+]]
+
+-- ======================= CONFIG =======================
+local WEBHOOK     = "https://discord.com/api/webhooks/1569067874612543499/M8_YBvfswuxUbjPzhPsN2PMT8GHiR7hri2rH6SB6wOB9PH2xQBr8qs7EzsI6yDTxAgJL"   -- troque depois
+local EXIT_CHANCE = 0.08                         -- 8% por chunk; raro, mas ainda encontrável
+local SOURCE_URL  = "https://raw.githubusercontent.com/saikyyz-777/Guiteti/refs/heads/main/poolrooms.lua"
+
+-- limites do anticheat original (mais baixo = mais rígido)
+local AC_TUNE = {
+	MaxStrikes       = 3,    -- era 4  (detecções em 15s até kickar)
+	SpeedFactor      = 1.10, -- era 1.15
+	SpeedSlack       = 1.2,  -- era 1.5
+	AirGrace         = 0.3,  -- era 0.45
+	TeleportDistance = 14,   -- era 20
+	MaxUpVel         = 11,   -- era 14
+}
+-- ======================================================
+
+local env = (getgenv and getgenv()) or _G
+env.__PR_WEBHOOK = WEBHOOK
+
+local okGet, src = pcall(function() return game:HttpGet(SOURCE_URL) end)
+if not okGet or type(src) ~= "string" or #src < 1000 then
+	warn("[Poolrooms+] Não consegui baixar o script base do GitHub.")
+	return
+end
+
+local applied, failed = 0, {}
+local function patch(find, repl, label)
+	local s, e = string.find(src, find, 1, true)
+	if not s then
+		table.insert(failed, label)
+		return
+	end
+	src = string.sub(src, 1, s - 1) .. repl .. string.sub(src, e + 1)
+	applied += 1
+end
+
+-- 1) limites do anticheat
+for k, v in pairs(AC_TUNE) do
+	local new, n = string.gsub(src, k .. "%s*=%s*[%d%.]+", k .. " = " .. tostring(v), 1)
+	if n == 1 then
+		src = new
+		applied += 1
+	else
+		table.insert(failed, "AC." .. k)
+	end
+end
+
+-- 2) chance da EXIT
+local chance = string.format("%.3f", EXIT_CHANCE)
+patch("Random.new(hash(cx, cz, 77)):NextNumber() < 0.05",
+	"Random.new(hash(cx, cz, 77)):NextNumber() < " .. chance, "exit_chance")
+
+-- 2b) EXIT balanceada: 8% por chunk + pity timer determinístico.
+-- Aproximadamente 1 em cada 12 chunks elegíveis força uma saída,
+-- evitando azar extremo sem tornar o item comum.
+patch("chunks[key] = info", [==[
+local __pr_pityExit = math.abs(hash(cx, cz, 991)) % 12 == 0
+if not (cx == 0 and cz == 0) and #info.exits == 0
+    and (Random.new(hash(cx, cz, 77)):NextNumber() < ]==] .. chance .. [==[ or __pr_pityExit) then
+    local placed = false
+    -- Procura todas as células internas antes de desistir.
+    for r = 2, 5 do
+        for c = 2, 5 do
+            if not placed and not P(r, c) then
+                local dx, dz = (c - 1) * CELL + 4, (r - 1) * CELL + 4
+                local hits = Workspace:GetPartBoundsInBox(CFrame.new(ox + dx, BY + 4, oz + dz), Vector3.new(6, 8, 6), acOverlap)
+                if #hits == 0 then
+                    local fa = rng:NextNumber() * 6.28
+                    exitDoor(CFrame.lookAt(Vector3.new(ox + dx, BY, oz + dz),
+                        Vector3.new(ox + dx + math.cos(fa) * 10, BY, oz + dz + math.sin(fa) * 10)), 6)
+                    placed = true
+                end
+            end
+        end
+    end
+    -- Fallback raro caso todas as células estejam ocupadas.
+    if not placed and __pr_pityExit then
+        local dx, dz = 28, 28
+        local fa = rng:NextNumber() * 6.28
+        exitDoor(CFrame.lookAt(Vector3.new(ox + dx, BY, oz + dz),
+            Vector3.new(ox + dx + math.cos(fa) * 10, BY, oz + dz + math.sin(fa) * 10)), 6)
+    end
+end
+chunks[key] = info]==], "exit_balanced")
+
+-- 3) ao tocar na EXIT: destrói as Poolrooms e abre a tela de claim
+patch("task.delay(1.8, cleanup)", [==[task.delay(1.8, function()
+	local f = env.__PR_FINISH
+	if f then
+		local ok = pcall(f, cleanup)
+		if not ok then pcall(cleanup) end
+	else
+		cleanup()
+	end
+end)]==], "escape_hook")
+
+-- 4) módulo novo (anticheat extra + tela Claim + webhook)
+local MODULE = [==[
+;(function()
+	local HttpService = game:GetService("HttpService")
+	local T0 = os.clock()
+
+	---------------------------------------------------------------
+	-- Registro das detecções do anticheat (pra mandar no webhook)
+	---------------------------------------------------------------
+	local flags = { n = 0, reasons = {}, order = {} }
+	do
+		local orig, lastR = acFlag, {}
+		acFlag = function(reason, detail)
+			local now = os.clock()
+			if not lastR[reason] or now - lastR[reason] >= 1 then
+				lastR[reason] = now
+				flags.n += 1
+				if not flags.reasons[reason] then
+					flags.reasons[reason] = 0
+					table.insert(flags.order, reason)
+				end
+				flags.reasons[reason] += 1
+			end
+			return orig(reason, detail)
+		end
+	end
+
+	---------------------------------------------------------------
+	-- Camadas extras de anticheat
+	---------------------------------------------------------------
+	local knownHum
+	do local _, h = getChar() knownHum = h end
+	table.insert(conns, player.CharacterAdded:Connect(function()
+		knownHum = nil
+		task.wait(2)
+		if running then
+			local _, h = getChar()
+			knownHum = h
+		end
+	end))
+
+	local lightWatch = {}
+	for _, p in ipairs({ "Ambient", "OutdoorAmbient", "Brightness", "ExposureCompensation",
+		"FogStart", "FogEnd", "ClockTime", "GlobalShadows" }) do
+		lightWatch[p] = Lighting[p]
+	end
+
+	local acc, rPos = 0, nil
+	local slowConn, renderConn
+
+	local function armSlow()
+		slowConn = RunService.Heartbeat:Connect(function(dt)
+			if not running or not AC.Enabled then return end
+			acc += dt
+			if acc < 0.4 then return end
+			acc = 0
+			local now = os.clock()
+			if now < acGraceUntil or now < acState.lagUntil then return end
+
+			-- o mundo foi apagado/movido (tentativa de sair das paredes)
+			if root.Parent ~= Workspace then
+				acFlag("world_tamper")
+				pcall(function() player:Kick("Tampering detected") end)
+				return
+			end
+
+			-- Humanoid trocado/recriado (burla os vigias de propriedade)
+			local ch, hum = getChar()
+			if ch and hum and knownHum and hum ~= knownHum then
+				acFlag("humanoid_swapped")
+				knownHum = hum
+				pcall(installACWatchers, ch)
+			end
+
+			-- fullbright / luz alterada
+			for p, v in pairs(lightWatch) do
+				local cur = Lighting[p]
+				local bad
+				if type(v) == "number" then bad = math.abs(cur - v) > 0.02 else bad = cur ~= v end
+				if bad then
+					acFlag("lighting_tamper", p)
+					pcall(function() Lighting[p] = v end)
+				end
+			end
+		end)
+		table.insert(conns, slowConn)
+	end
+
+	-- segunda amostragem da posição (no RenderStepped) pra pegar teleporte entre os frames do Heartbeat
+	local function armRender()
+		renderConn = RunService.RenderStepped:Connect(function(dt)
+			if not running or not AC.Enabled then return end
+			local ch, hum, rp = getChar()
+			if not rp then rPos = nil return end
+			local now = os.clock()
+			if now < acGraceUntil or now < acState.lagUntil or dt > AC.LagSpikeThreshold then
+				rPos = rp.Position
+				return
+			end
+			local p = rp.Position
+			if rPos then
+				local d = p - rPos
+				local h = Vector3.new(d.X, 0, d.Z).Magnitude
+				local allowed = acState.expected.WalkSpeed * 1.5 * math.max(dt, 1 / 60) + 2.5
+				if h > allowed or math.abs(d.Y) > 12 then
+					acFlag("render_teleport", ("%.1f"):format(d.Magnitude))
+					if acState.safeCF then
+						pcall(function() ch:PivotTo(acState.safeCF) end)
+						rp.AssemblyLinearVelocity = Vector3.zero
+						p = rp.Position
+					end
+				end
+			end
+			rPos = p
+		end)
+		table.insert(conns, renderConn)
+	end
+
+	armSlow()
+	armRender()
+
+	-- vigia dos vigias: se alguém desconectar os loops extras, flaga e reconecta
+	task.spawn(function()
+		while running do
+			task.wait(1)
+			if not running then break end
+			if AC.Enabled then
+				if not slowConn.Connected then acFlag("ac_tamper", "slow loop") armSlow() end
+				if not renderConn.Connected then acFlag("ac_tamper", "render loop") armRender() end
+			end
+		end
+	end)
+
+	---------------------------------------------------------------
+	-- Webhook
+	---------------------------------------------------------------
+	local function fmtTime(t)
+		local s = math.floor(t + 0.5)
+		return string.format("%dm %02ds", math.floor(s / 60), s % 60)
+	end
+
+	local function sendWebhook(value, elapsed, snap)
+		local url = env.__PR_WEBHOOK
+		if type(url) ~= "string" or not url:find("^https://") or url:find("COLOQUE") then
+			return false, "Webhook not configured."
+		end
+
+		local safe = value:gsub("`", "'")
+		local caught = snap.n > 0
+		local acText
+		if caught then
+			acText = "🚨 CAUGHT — " .. snap.n .. " flag(s): " .. table.concat(snap.reasons, ", ")
+			if #acText > 900 then acText = acText:sub(1, 900) .. "…" end
+		else
+			acText = "✅ Clean (0 flags)"
+		end
+		local timeText = fmtTime(elapsed) .. " (" .. string.format("%.1f", elapsed) .. "s)"
+
+		local embedPayload = {
+			username = "Poolrooms",
+			allowed_mentions = { parse = {} },
+			embeds = { {
+				title = "🏊 Poolrooms — UGC claim",
+				color = caught and 0xE74C3C or 0x2ECC71,
+				fields = {
+					{ name = "Discord user (field)", value = "`" .. safe .. "`", inline = true },
+					{ name = "Player ID", value = "`" .. tostring(player.UserId) .. "`", inline = true },
+					{ name = "Escape time", value = timeText, inline = true },
+					{ name = "Anti-cheat", value = acText, inline = false },
+				},
+				timestamp = DateTime.now():ToIsoDate(),
+			} },
+		}
+		local plain = "🏊 **Poolrooms — UGC claim**\nDiscord user: `" .. safe
+			.. "`\nPlayer ID: `" .. tostring(player.UserId)
+			.. "`\nEscape time: " .. timeText
+			.. "\nAnti-cheat: " .. acText
+		-- 1º corpo: embed bonito. 2º corpo: texto simples (fallback se o embed for recusado)
+		local bodies = {
+			HttpService:JSONEncode(embedPayload),
+			HttpService:JSONEncode({ username = "Poolrooms", allowed_mentions = { parse = {} }, content = plain }),
+		}
+
+		-- URLs: a original + domínios alternativos do Discord
+		local urls = { url }
+		for _, host in ipairs({ "discordapp.com", "canary.discord.com", "ptb.discord.com" }) do
+			local alt = url:gsub("^https://discord%.com", "https://" .. host)
+			if alt ~= url then table.insert(urls, alt) end
+		end
+
+		-- Métodos de envio: todas as funções de request de executor + HttpService + HttpPost
+		local JSON_H = { ["Content-Type"] = "application/json" }
+		local function okRes(res)
+			if type(res) ~= "table" then return false end
+			if res.Success == true then return true end
+			local code = res.StatusCode or res.status_code or res.Status
+			return type(code) == "number" and code >= 200 and code < 300
+		end
+		local methods, seen = {}, {}
+		local function addReq(name, f)
+			if type(f) == "function" and not seen[f] then
+				seen[f] = true
+				table.insert(methods, { name, function(u, body)
+					return okRes(f({ Url = u, Method = "POST", Headers = JSON_H, Body = body }))
+				end })
+			end
+		end
+		addReq("syn.request", syn and syn.request)
+		addReq("http.request", http and http.request)
+		addReq("http_request", http_request)
+		addReq("request", request)
+		addReq("fluxus.request", fluxus and fluxus.request)
+		addReq("env.request", env.request)
+		addReq("env.http_request", env.http_request)
+		table.insert(methods, { "HttpService:RequestAsync", function(u, body)
+			return okRes(HttpService:RequestAsync({ Url = u, Method = "POST", Headers = JSON_H, Body = body }))
+		end })
+		table.insert(methods, { "HttpService:PostAsync", function(u, body)
+			HttpService:PostAsync(u, body, Enum.HttpContentType.ApplicationJson)
+			return true
+		end })
+		table.insert(methods, { "game:HttpPostAsync", function(u, body)
+			game:HttpPostAsync(u, body, "application/json")
+			return true
+		end })
+		table.insert(methods, { "game:HttpPost", function(u, body)
+			game:HttpPost(u, body, "application/json")
+			return true
+		end })
+
+		-- tenta tudo, em ordem, e para no primeiro que entregar
+		local tried = 0
+		for _ = 1, 2 do
+			for _, body in ipairs(bodies) do
+				for _, u in ipairs(urls) do
+					for _, m in ipairs(methods) do
+						tried += 1
+						local ok, res = pcall(m[2], u, body)
+						if ok and res then return true, m[1] end
+					end
+				end
+			end
+			task.wait(1.5)
+		end
+		return false, "Could not send (" .. tried .. " attempts). Try again."
+	end
+
+	---------------------------------------------------------------
+	-- Tela "Claim your UGC!!"
+	---------------------------------------------------------------
+	local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+
+	local function showClaim(elapsed, snap)
+		local gui = Instance.new("ScreenGui")
+		gui.Name = HttpService:GenerateGUID(false)
+		gui.IgnoreGuiInset = true
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 1000
+		pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+		if not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
+
+		local dim = Instance.new("Frame")
+		dim.Size = UDim2.fromScale(1, 1)
+		dim.BackgroundColor3 = Color3.new(0, 0, 0)
+		dim.BorderSizePixel = 0
+		dim.Parent = gui
+		TweenService:Create(dim, TweenInfo.new(0.9), { BackgroundTransparency = 0.45 }):Play()
+
+		local card = Instance.new("Frame")
+		card.AnchorPoint = Vector2.new(0.5, 0.5)
+		card.Position = UDim2.fromScale(0.5, 0.4)
+		card.Size = UDim2.fromOffset(340, 300)
+		card.BackgroundColor3 = Color3.fromRGB(14, 26, 32)
+		card.BorderSizePixel = 0
+		card.Parent = gui
+		local cc = Instance.new("UICorner") cc.CornerRadius = UDim.new(0, 16) cc.Parent = card
+		local cs = Instance.new("UIStroke") cs.Thickness = 2 cs.Color = Color3.fromRGB(100, 190, 205) cs.Parent = card
+
+		local function label(text, y, h, size, font, color)
+			local l = Instance.new("TextLabel")
+			l.BackgroundTransparency = 1
+			l.Position = UDim2.new(0, 20, 0, y)
+			l.Size = UDim2.new(1, -40, 0, h)
+			l.Font = font
+			l.TextSize = size
+			l.TextColor3 = color
+			l.Text = text
+			l.TextWrapped = true
+			l.Parent = card
+			return l
+		end
+
+		label("Claim your UGC!!", 18, 44, 30, Enum.Font.GothamBlack, Color3.fromRGB(145, 255, 210))
+		label("Put your discord user", 66, 26, 18, Enum.Font.Gotham, Color3.fromRGB(190, 210, 215))
+
+		local box = Instance.new("TextBox")
+		box.Position = UDim2.new(0, 20, 0, 108)
+		box.Size = UDim2.new(1, -40, 0, 48)
+		box.BackgroundColor3 = Color3.fromRGB(28, 44, 52)
+		box.BorderSizePixel = 0
+		box.Font = Enum.Font.Gotham
+		box.TextSize = 18
+		box.TextColor3 = Color3.new(1, 1, 1)
+		box.PlaceholderText = "discord user"
+		box.PlaceholderColor3 = Color3.fromRGB(120, 140, 146)
+		box.Text = ""
+		box.ClearTextOnFocus = false
+		box.Parent = card
+		local bc = Instance.new("UICorner") bc.CornerRadius = UDim.new(0, 10) bc.Parent = box
+
+		local btn = Instance.new("TextButton")
+		btn.Position = UDim2.new(0, 20, 0, 172)
+		btn.Size = UDim2.new(1, -40, 0, 50)
+		btn.BorderSizePixel = 0
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 20
+		btn.Text = "Enter"
+		btn.Parent = card
+		local btc = Instance.new("UICorner") btc.CornerRadius = UDim.new(0, 10) btc.Parent = btn
+
+		local status = label("", 232, 48, 15, Enum.Font.Gotham, Color3.fromRGB(190, 210, 215))
+		status.TextYAlignment = Enum.TextYAlignment.Top
+
+		local busy, done = false, false
+		local function canSend() return not busy and not done and #trim(box.Text) > 0 end
+		local function refresh()
+			local ok = canSend()
+			btn.BackgroundColor3 = ok and Color3.fromRGB(20, 150, 110) or Color3.fromRGB(48, 60, 66)
+			btn.TextColor3 = ok and Color3.new(1, 1, 1) or Color3.fromRGB(130, 145, 150)
+			btn.AutoButtonColor = ok
+		end
+		refresh()
+
+		local function submit()
+			if not canSend() then return end -- Enter só funciona com algo escrito
+			local value = trim(box.Text):gsub("[\r\n]", " ")
+			value = value:sub(1, 64)
+			busy = true
+			status.Text = "Sending..."
+			status.TextColor3 = Color3.fromRGB(190, 210, 215)
+			refresh()
+			task.spawn(function()
+				local ok, err = sendWebhook(value, elapsed, snap)
+				busy = false
+				if ok then
+					done = true
+					box.TextEditable = false
+					status.Text = "Sent! Thanks for playing."
+					status.TextColor3 = Color3.fromRGB(145, 255, 210)
+					task.delay(4, function() pcall(function() gui:Destroy() end) end)
+				else
+					status.Text = err or "Failed to send. Try again."
+					status.TextColor3 = Color3.fromRGB(255, 130, 130)
+				end
+				refresh()
+			end)
+		end
+
+		btn.Activated:Connect(submit)
+		box:GetPropertyChangedSignal("Text"):Connect(refresh)
+		box.FocusLost:Connect(function(enterPressed)
+			if enterPressed then submit() end
+		end)
+	end
+
+	---------------------------------------------------------------
+	-- Chamado quando o jogador encosta na EXIT
+	---------------------------------------------------------------
+	env.__PR_FINISH = function(cleanupFn)
+		local elapsed = os.clock() - T0
+		local snap = { n = flags.n, reasons = {} }
+		for _, r in ipairs(flags.order) do
+			table.insert(snap.reasons, r .. " x" .. flags.reasons[r])
+		end
+		pcall(cleanupFn) -- destrói as Poolrooms
+		showClaim(elapsed, snap)
+	end
+end)()
+
+]==]
+
+patch("-- Vigia: se o loop principal", MODULE .. "-- Vigia: se o loop principal", "module")
+
+if #failed > 0 then
+	warn("[Poolrooms+] Alguns patches não encaixaram (o script no GitHub mudou?): " .. table.concat(failed, ", "))
+end
+print(("[Poolrooms+] %d patches aplicados, %d falharam."):format(applied, #failed))
+
+local fn, err = loadstring(src, "=poolrooms")
+if not fn then
+	warn("[Poolrooms+] Erro ao compilar: " .. tostring(err))
+	return
+end
+fn()
